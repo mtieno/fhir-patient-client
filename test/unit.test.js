@@ -221,3 +221,203 @@ test('createClient validates input', () => {
   assert.throws(() => createClient({}), /baseUrl/);
   assert.throws(() => createClient({ baseUrl: 'x', fetch: null }), /fetch/);
 });
+
+// --- getOrNull ---------------------------------------------------------
+
+test('getOrNull returns null on 404', async () => {
+  const fetch = fakeFetch([
+    {
+      status: 404,
+      body: { resourceType: 'OperationOutcome', issue: [{ severity: 'error' }] },
+    },
+  ]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  const result = await client.patients.getOrNull('missing');
+  assert.equal(result, null);
+});
+
+test('getOrNull returns null on 410 (gone)', async () => {
+  const fetch = fakeFetch([{ status: 410, body: {} }]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  assert.equal(await client.patients.getOrNull('deleted'), null);
+});
+
+test('getOrNull rethrows non-404/410 errors', async () => {
+  const fetch = fakeFetch([{ status: 500, body: {} }]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  await assert.rejects(() => client.patients.getOrNull('x'), FhirError);
+});
+
+test('getOrNull resolves normally when the resource exists', async () => {
+  const fetch = fakeFetch([
+    { status: 200, body: { resourceType: 'Patient', id: '1' } },
+  ]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  const p = await client.patients.getOrNull('1');
+  assert.equal(p.id, '1');
+});
+
+// --- retry with backoff -------------------------------------------------
+
+function noopSleep() {
+  return Promise.resolve();
+}
+
+test('retries a 503 and succeeds on the next attempt', async () => {
+  const fetch = fakeFetch([
+    { status: 503, statusText: 'Service Unavailable', body: {} },
+    { status: 200, body: { resourceType: 'Patient', id: '1' } },
+  ]);
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 2,
+    sleep: noopSleep,
+  });
+  const p = await client.patients.get('1');
+  assert.equal(p.id, '1');
+  assert.equal(fetch.calls.length, 2);
+});
+
+test('retries a 429 the same way as a 5xx', async () => {
+  const fetch = fakeFetch([
+    { status: 429, body: {} },
+    { status: 200, body: { resourceType: 'Patient', id: '1' } },
+  ]);
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 1,
+    sleep: noopSleep,
+  });
+  const p = await client.patients.get('1');
+  assert.equal(p.id, '1');
+});
+
+test('does not retry a 404', async () => {
+  const fetch = fakeFetch([{ status: 404, body: {} }]);
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 3,
+    sleep: noopSleep,
+  });
+  await assert.rejects(() => client.patients.get('missing'), FhirError);
+  assert.equal(fetch.calls.length, 1);
+});
+
+test('gives up after `retries` attempts and throws the last error', async () => {
+  const fetch = fakeFetch([
+    { status: 503, body: {} },
+    { status: 503, body: {} },
+    { status: 503, body: {} },
+  ]);
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 2,
+    sleep: noopSleep,
+  });
+  await assert.rejects(
+    () => client.patients.get('x'),
+    (err) => err.status === 503
+  );
+  assert.equal(fetch.calls.length, 3); // 1 initial + 2 retries
+});
+
+test('retries=0 disables retrying entirely', async () => {
+  const fetch = fakeFetch([{ status: 503, body: {} }]);
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 0,
+    sleep: noopSleep,
+  });
+  await assert.rejects(() => client.patients.get('x'), FhirError);
+  assert.equal(fetch.calls.length, 1);
+});
+
+test('backoff delay doubles between attempts', async () => {
+  const fetch = fakeFetch([
+    { status: 503, body: {} },
+    { status: 503, body: {} },
+    { status: 200, body: { resourceType: 'Patient', id: '1' } },
+  ]);
+  const delays = [];
+  const client = createClient({
+    baseUrl: 'https://x.test',
+    fetch,
+    retries: 2,
+    retryDelayMs: 100,
+    sleep: async (ms) => {
+      delays.push(ms);
+    },
+  });
+  await client.patients.get('1');
+  assert.deepEqual(delays, [100, 200]);
+});
+
+// --- $everything ---------------------------------------------------------
+
+test('everything() calls Patient/{id}/$everything', async () => {
+  const fetch = fakeFetch([
+    {
+      status: 200,
+      body: {
+        resourceType: 'Bundle',
+        entry: [{ resource: { resourceType: 'Patient', id: '1' } }],
+      },
+    },
+  ]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  const bundle = await client.patients.everything('1');
+  assert.equal(fetch.calls[0].url, 'https://x.test/Patient/1/$everything');
+  assert.equal(bundle.resourceType, 'Bundle');
+});
+
+test('everything() forwards extra params like _since and _count', async () => {
+  const fetch = fakeFetch([{ status: 200, body: { resourceType: 'Bundle' } }]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  await client.patients.everything('1', { _since: '2024-01-01', _count: 50 });
+  assert.equal(
+    fetch.calls[0].url,
+    'https://x.test/Patient/1/$everything?_since=2024-01-01&_count=50'
+  );
+});
+
+test('streamEverything() follows pagination and yields mixed resource types', async () => {
+  const fetch = fakeFetch([
+    {
+      status: 200,
+      body: {
+        resourceType: 'Bundle',
+        entry: [
+          { resource: { resourceType: 'Patient', id: 'p1' } },
+          { resource: { resourceType: 'Observation', id: 'o1' } },
+        ],
+        link: [{ relation: 'next', url: 'https://x.test/Patient/1/$everything?page=2' }],
+      },
+    },
+    {
+      status: 200,
+      body: {
+        resourceType: 'Bundle',
+        entry: [{ resource: { resourceType: 'Condition', id: 'c1' } }],
+      },
+    },
+  ]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+
+  const seen = [];
+  for await (const r of client.patients.streamEverything('1')) {
+    seen.push(`${r.resourceType}/${r.id}`);
+  }
+  assert.deepEqual(seen, ['Patient/p1', 'Observation/o1', 'Condition/c1']);
+});
+
+test('operation() supports type-level operations with no id', async () => {
+  const fetch = fakeFetch([{ status: 200, body: { resourceType: 'Parameters' } }]);
+  const client = createClient({ baseUrl: 'https://x.test', fetch, retries: 0 });
+  await client.operation('Patient', null, 'match', { resource: '{}' });
+  assert.equal(fetch.calls[0].url, 'https://x.test/Patient/$match?resource=%7B%7D');
+});

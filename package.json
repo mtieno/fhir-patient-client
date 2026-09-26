@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "fhir-patient-client",
   "version": "0.1.0",
   "description": "A friendly JavaScript client for downloading Patient data from any FHIR server.",
@@ -7,14 +7,18 @@
   "exports": {
     ".": "./src/index.js"
   },
-   "scripts": {
+  "scripts": {
     "test": "node --test test/unit.test.js",
     "test:integration": "node --test test/integration.test.js",
+    "typecheck": "tsc --noEmit -p .",
     "example": "node examples/basic.js",
     "example:observations": "node examples/observations.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
   },
   "license": "MIT"
 }
